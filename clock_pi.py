@@ -21,18 +21,15 @@ import requests
 import RPi.GPIO as GPIO
 from RPLCD.i2c import CharLCD
 
-# --- Настройки железа ---
-BUZZER_PIN = 11  # BCM numbering (GPIO11)
+BUZZER_PIN = 11
 I2C_ADDRESS = 0x27
 I2C_PORT = 1
 
-# --- Настройки будильника ---
 ALARM_HOUR = 7
 ALARM_MINUTE = 0
 
-# --- Настройки проверки тревоги ---
-POLTAVA_ALERT_API = "https://api.alerts.in.ua/v1/iot/active_air_raid_alerts_by_oblast.json"
-ALERT_CHECK_EVERY_SEC = 30
+ALERTS_API_URL = "https://api.alerts.in.ua/v1/alerts/active.json"
+ALERT_CHECK_EVERY_SEC = 30  # безопасно ниже лимита 8-10 запросов/мин
 ALERTS_TOKEN_ENV = "ALERTS_IN_UA_TOKEN"
 
 
@@ -45,46 +42,85 @@ def beep(ms_on: int, ms_off: int, times: int) -> None:
             sleep(ms_off / 1000.0)
 
 
+def parse_poltava_state(payload: dict):
+    """Пробуем достать состояние тревоги для Полтавской области из разных форматов API."""
+    # Формат со states
+    states = payload.get("states")
+    if isinstance(states, dict):
+        for key in ("Poltava", "Poltava Oblast", "Полтавська область", "Poltavs'ka oblast"):
+            if key in states:
+                return bool(states[key])
+
+    # Формат со списком alerts/active_alerts
+    alert_lists = []
+    for k in ("alerts", "active_alerts"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            alert_lists.append(v)
+
+    for alerts in alert_lists:
+        for item in alerts:
+            if not isinstance(item, dict):
+                continue
+            region_text = " ".join(
+                str(item.get(x, "")) for x in ("region", "region_name", "location_title", "title")
+            ).lower()
+            if "полтав" in region_text or "poltav" in region_text:
+                return True
+
+    return False
+
+
 def is_poltava_alert_active(timeout_sec: float = 3.0):
-    """Возвращает:
-    - True/False: удалось проверить, состояние тревоги
-    - None: проверить не удалось (например, нет токена)
+    """Возвращает кортеж: (state, status)
+    state: True/False/None
+    status: OK | NOT_MODIFIED | UNAUTHORIZED | FORBIDDEN | RATE_LIMIT | ERROR | NO_TOKEN
     """
     token = os.getenv(ALERTS_TOKEN_ENV)
     if not token:
-        return None
+        return None, "NO_TOKEN"
+
+    if not hasattr(is_poltava_alert_active, "last_modified"):
+        is_poltava_alert_active.last_modified = None
+        is_poltava_alert_active.cached_state = False
 
     headers = {"Authorization": f"Bearer {token}"}
+    if is_poltava_alert_active.last_modified:
+        headers["If-Modified-Since"] = is_poltava_alert_active.last_modified
+
+    params = {"token": token}
 
     try:
-        response = requests.get(POLTAVA_ALERT_API, headers=headers, timeout=timeout_sec)
+        response = requests.get(ALERTS_API_URL, headers=headers, params=params, timeout=timeout_sec)
+
+        if response.status_code == 304:
+            return is_poltava_alert_active.cached_state, "NOT_MODIFIED"
+        if response.status_code == 401:
+            return None, "UNAUTHORIZED"
+        if response.status_code == 403:
+            return None, "FORBIDDEN"
+        if response.status_code == 429:
+            return None, "RATE_LIMIT"
+
         response.raise_for_status()
-        data = response.json()
+        payload = response.json()
+        state = parse_poltava_state(payload)
 
-        states = data.get("states", data)
-        candidates = ["Poltava", "Poltava Oblast", "Полтавська область", "Poltavs'ka oblast"]
-        for key in candidates:
-            if key in states:
-                return bool(states[key])
+        is_poltava_alert_active.cached_state = state
+        last_modified = response.headers.get("Last-Modified")
+        if last_modified:
+            is_poltava_alert_active.last_modified = last_modified
+
+        return state, "OK"
     except Exception:
-        return None
-
-    return None
+        return None, "ERROR"
 
 
 def main() -> None:
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-    lcd = CharLCD(
-        i2c_expander="PCF8574",
-        address=I2C_ADDRESS,
-        port=I2C_PORT,
-        cols=16,
-        rows=2,
-        charmap="A00",
-        auto_linebreaks=False,
-    )
+    lcd = CharLCD(i2c_expander="PCF8574", address=I2C_ADDRESS, port=I2C_PORT, cols=16, rows=2, charmap="A00", auto_linebreaks=False)
 
     alarm_triggered_today = False
     last_day = datetime.now().day
@@ -107,41 +143,41 @@ def main() -> None:
 
             if monotonic() - last_alert_check >= ALERT_CHECK_EVERY_SEC:
                 last_alert_check = monotonic()
-                state = is_poltava_alert_active()
+                state, status = is_poltava_alert_active()
 
-                if state is None:
+                if status == "NO_TOKEN":
                     alert_status_line = "NO ALERT TOKEN"
-                elif state:
+                elif status == "UNAUTHORIZED":
+                    alert_status_line = "BAD ALERT TOKEN"
+                elif status == "FORBIDDEN":
+                    alert_status_line = "ALERT FORBIDDEN"
+                elif status == "RATE_LIMIT":
+                    alert_status_line = "ALERT RATE LIMIT"
+                elif state is True:
                     alert_status_line = "POLTAVA ALERT!"
                     if not last_alert_state:
                         beep(120, 80, 10)
-                else:
+                elif state is False:
                     alert_status_line = "ALERT: OFF"
+                else:
+                    alert_status_line = "ALERT: ERROR"
 
-                last_alert_state = bool(state)
+                if state is not None:
+                    last_alert_state = state
 
             line1 = now.strftime("%H:%M:%S").ljust(16)
-            if alert_status_line in ("POLTAVA ALERT!", "NO ALERT TOKEN"):
-                line2 = alert_status_line.ljust(16)
-            else:
-                line2 = now.strftime("%d.%m.%Y").ljust(16)
+            line2 = (alert_status_line if alert_status_line in ("POLTAVA ALERT!", "NO ALERT TOKEN", "BAD ALERT TOKEN", "ALERT FORBIDDEN", "ALERT RATE LIMIT") else now.strftime("%d.%m.%Y")).ljust(16)
 
             lcd.cursor_pos = (0, 0)
             lcd.write_string(line1)
             lcd.cursor_pos = (1, 0)
             lcd.write_string(line2)
 
-            if (
-                not alarm_triggered_today
-                and now.hour == ALARM_HOUR
-                and now.minute == ALARM_MINUTE
-                and now.second < 3
-            ):
+            if (not alarm_triggered_today and now.hour == ALARM_HOUR and now.minute == ALARM_MINUTE and now.second < 3):
                 alarm_triggered_today = True
                 beep(250, 150, 8)
 
             sleep(0.2)
-
     finally:
         lcd.clear()
         GPIO.output(BUZZER_PIN, GPIO.LOW)
