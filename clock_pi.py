@@ -2,7 +2,7 @@
 """
 Часы для Raspberry Pi:
 - LCD 16x2 по I2C (PCF8574, обычно адрес 0x27)
-- Пищалка на GPIO11
+- Пищалка на GPIO11 (активная или пассивная)
 - Ежедневный будильник
 - Проверка тревоги в Полтаве (alerts.in.ua API)
 
@@ -22,6 +22,8 @@ import RPi.GPIO as GPIO
 from RPLCD.i2c import CharLCD
 
 BUZZER_PIN = 11
+BUZZER_TYPE = os.getenv("BUZZER_TYPE", "active").strip().lower()  # active | passive
+PASSIVE_BUZZER_FREQ_HZ = 2000
 I2C_ADDRESS = 0x27
 I2C_PORT = 1
 
@@ -34,10 +36,22 @@ ALERTS_TOKEN_ENV = "ALERTS_IN_UA_TOKEN"
 
 
 def beep(ms_on: int, ms_off: int, times: int) -> None:
+    use_passive = BUZZER_TYPE == "passive"
+    pwm = None
+
+    if use_passive:
+        pwm = GPIO.PWM(BUZZER_PIN, PASSIVE_BUZZER_FREQ_HZ)
+
     for i in range(times):
-        GPIO.output(BUZZER_PIN, GPIO.HIGH)
+        if use_passive and pwm is not None:
+            pwm.start(50)  # 50% скважность
+        else:
+            GPIO.output(BUZZER_PIN, GPIO.HIGH)
         sleep(ms_on / 1000.0)
-        GPIO.output(BUZZER_PIN, GPIO.LOW)
+        if use_passive and pwm is not None:
+            pwm.stop()
+        else:
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
         if i < times - 1:
             sleep(ms_off / 1000.0)
 
